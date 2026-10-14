@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>文档</title>
+<link rel="stylesheet" href="vendor/github.min.css" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" href="vendor/github-dark.min.css" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/"><span class="logo">文</span><span>文档</span></a>
+  <label class="sbox"><svg viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></svg><input id="search" type="search" placeholder="搜索标题或全文…" autocomplete="off"></label>
+  <div class="actions">
+    <button id="btnNew" class="btn primary">新建文章</button>
+    <button id="btnFolder" class="btn">新建文件夹</button>
+    <span id="who" class="who" title="点击登录"><i></i>只读</span>
+  </div>
+</header>
+<main id="app"></main>
+
+<div id="modal" class="modal hidden">
+  <div class="dialog">
+    <h3 id="mTitle"></h3>
+    <div id="mBody"></div>
+    <div class="row end">
+      <button id="mCancel" class="btn">取消</button>
+      <button id="mOk" class="btn primary">确定</button>
+    </div>
+  </div>
+</div>
+<div id="lightbox" class="lightbox hidden"><img alt=""></div>
+<div id="toast" class="toast hidden"></div>
+
+<script src="vendor/marked.min.js"></script>
+<script src="vendor/purify.min.js"></script>
+<script src="vendor/highlight.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
