@@ -178,7 +178,11 @@ async def guard_all(request: Request, call_next):
             require_auth(request.cookies.get("mdn"))
         except HTTPException:
             return JSONResponse({"detail": "need login"}, status_code=401)
-    return await call_next(request)
+    resp = await call_next(request)
+    # Always revalidate (cheap 304 via ETag) so a redeploy never mixes old cached css/js with new html;
+    # pinned third-party libs under /vendor/ can be cached for a week.
+    resp.headers.setdefault("Cache-Control", "public, max-age=604800" if path.startswith("/vendor/") else "no-cache")
+    return resp
 
 
 @app.post("/api/login")
