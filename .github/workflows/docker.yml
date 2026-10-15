@@ -36,6 +36,9 @@ jobs:
           assert c2.get("/api/comments", params={"path": "demo/index.md"}).json()[0]["anchor"]["exact"] == "hi"
           assert c2.delete("/api/comments", params={"path": "demo/index.md", "id": r["id"], "key": "bad"}).status_code == 401
           assert c2.delete("/api/comments", params={"path": "demo/index.md", "id": r["id"], "key": r["key"]}).status_code == 200
+          import io, zipfile
+          z = c2.get("/api/download", params={"path": "demo/index.md"})
+          assert z.status_code == 200 and zipfile.ZipFile(io.BytesIO(z.content)).namelist() == ["Hello/index.md"]
           PY
 
       - uses: docker/setup-qemu-action@v3

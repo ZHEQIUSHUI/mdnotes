@@ -28,6 +28,7 @@ const ICON = {
   folder: '<svg viewBox="0 0 16 16"><path d="M1.75 4.25c0-.83.67-1.5 1.5-1.5h3l1.5 1.75h5c.83 0 1.5.67 1.5 1.5v5.75c0 .83-.67 1.5-1.5 1.5h-9.5c-.83 0-1.5-.67-1.5-1.5z"/></svg>',
   edit: '<svg viewBox="0 0 16 16"><path d="M11 2.5l2.5 2.5L6 12.5H3.5V10z"/></svg>',
   note: '<svg viewBox="0 0 16 16"><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z"/></svg>',
+  down: '<svg viewBox="0 0 16 16"><path d="M8 2.5v8M4.5 7.5 8 11l3.5-3.5M3 13.5h10"/></svg>',
   empty: '<svg viewBox="0 0 16 16" class="big"><path d="M3 2h7l3 3v9H3zM10 2v3h3"/></svg>',
 };
 function toast(msg, ms = 2200) {
@@ -244,7 +245,7 @@ async function viewArticle(path) {
       <div class="crumb"><a href="#/">全部</a>${folder ? ` / <a href="#/f/${enc(folder)}">${esc(folder)}</a>` : ""}</div>
       <h1>${esc(a.title)}</h1>
       <div class="meta"><span>创建 ${esc(a.meta.created || "-")}</span><span class="dot">·</span><span>最后修改 ${esc(a.meta.updated || "-")}</span><span class="sp"></span>
-        <button class="btn small primary" id="aEdit">${ICON.edit}编辑</button><button class="btn small" id="aRen">重命名</button>
+        <button class="btn small primary" id="aEdit">${ICON.edit}编辑</button><a class="btn small" href="/api/download?path=${encodeURIComponent(path)}" download title="下载 Markdown 和文中用到的图片、视频（zip）">${ICON.down}下载</a><button class="btn small" id="aRen">重命名</button>
         <button class="btn small" id="aMove">移动</button><button class="btn small danger" id="aDel">删除</button></div>
     </div><div class="md" id="body"></div><section class="cmts" id="cmts"></section></article><aside class="toc" id="toc"></aside></div>`;
   document.title = a.title + " - 文档";

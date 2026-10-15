@@ -40,7 +40,7 @@ a:hover { text-decoration: underline; }
 .who.on { color: var(--ok); cursor: default; } .who.on i { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
 .btn { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 14px; border: 1px solid var(--line2); border-radius: 9px;
   background: var(--surface); color: var(--fg); cursor: pointer; font-size: 14px; white-space: nowrap; transition: .15s; font-family: inherit; }
-.btn:hover { background: var(--hover); border-color: var(--line2); }
+.btn:hover { background: var(--hover); border-color: var(--line2); text-decoration: none; }
 .btn:active { transform: translateY(1px); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; box-shadow: 0 1px 3px color-mix(in srgb, var(--accent) 40%, transparent); }
 .btn.primary:hover { background: color-mix(in srgb, var(--accent) 88%, #000); }

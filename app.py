@@ -11,12 +11,15 @@ import os
 import re
 import secrets
 import shutil
+import tempfile
 import threading
 import time
+import zipfile
 from datetime import datetime
+from urllib.parse import quote, unquote
 from pathlib import Path
 
-from fastapi import Body, Cookie, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Body, Cookie, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -477,6 +480,55 @@ async def upload(path: str = Form(...), file: UploadFile = File(...), mdn: str |
         while chunk := await file.read(1 << 20):
             f.write(chunk)
     return {"name": dst.name}
+
+
+# ---------- download as zip ----------
+
+STORED = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm", ".mov", ".m4v", ".zip", ".gz", ".7z", ".mp3"}
+LINK_RE = re.compile(r"""(?:!?\[[^\]]*\]\(\s*<?([^)\s>]+)>?|<(?:img|video|source|a)\b[^>]*?(?:src|href)=["']([^"']+)["'])""", re.I)
+
+
+def zip_members(p: Path):
+    """An article that owns its folder ships the whole folder (minus hidden files);
+    a loose .md ships itself plus the local files it links to."""
+    if p.name == "index.md" and p.parent != DATA:
+        root = p.parent
+        for f in sorted(root.rglob("*")):
+            rel = f.relative_to(root)
+            if f.is_file() and not any(x.startswith(".") for x in rel.parts):
+                yield f, rel.as_posix()
+        return
+    yield p, p.name
+    seen = set()
+    for m in LINK_RE.finditer(p.read_text(encoding="utf-8", errors="replace")):
+        link = unquote((m.group(1) or m.group(2)).split("#")[0].split("?")[0])
+        if not link or re.match(r"^([a-z][a-z0-9+.-]*:|/)", link, re.I) or link in seen:
+            continue
+        seen.add(link)
+        try:
+            f = safe((p.parent.relative_to(DATA) / link).as_posix())
+        except HTTPException:
+            continue
+        if f.is_file() and p.parent in f.parents:  # links that climb out of the folder are left out
+            yield f, f.relative_to(p.parent).as_posix()
+
+
+@app.get("/api/download")
+def download(path: str, tasks: BackgroundTasks):
+    p = safe(path)
+    if not p.is_file() or p.suffix != ".md":
+        raise HTTPException(404, "not found")
+    meta, body = parse(p.read_text(encoding="utf-8", errors="replace"))
+    name = slugify(title_of(meta, body, p))
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    with zipfile.ZipFile(tmp, "w") as z:
+        for f, arc in zip_members(p):
+            kind = zipfile.ZIP_STORED if f.suffix.lower() in STORED else zipfile.ZIP_DEFLATED
+            z.write(f, f"{name}/{arc}", compress_type=kind)
+    tmp.close()
+    tasks.add_task(os.unlink, tmp.name)
+    return FileResponse(tmp.name, media_type="application/zip", headers={
+        "Content-Disposition": f"attachment; filename=\"article.zip\"; filename*=UTF-8''{quote(name + '.zip')}"})
 
 
 # ---------- files (with Range for video seeking) ----------
