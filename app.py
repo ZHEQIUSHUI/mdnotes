@@ -5,11 +5,13 @@ password is set); all = everything needs login. AUTH_USER is optional; when set,
 """
 import hashlib
 import hmac
+import json
 import mimetypes
 import os
 import re
 import secrets
 import shutil
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -206,6 +208,110 @@ def me(mdn: str | None = Cookie(None)):
     return {"editor": editor, "mode": MODE, "need_user": bool(USER)}
 
 
+# ---------- comments & annotations ----------
+# Public (no password, except under AUTH_MODE=all). Stored next to the article in a hidden sidecar file
+# so move / delete carry them along. An annotation is a comment with an anchor: a W3C-style text quote
+# selector {exact, prefix, suffix} over the rendered article text; exact == "" marks a point position.
+
+COMMENT_LOCK = threading.Lock()
+
+
+def comments_file(p: Path) -> Path:
+    return p.parent / ".comments.json" if p.name == "index.md" else p.parent / f".{p.name}.comments.json"
+
+
+def load_comments(p: Path) -> list:
+    f = comments_file(p)
+    try:
+        return json.loads(f.read_text(encoding="utf-8")) if f.is_file() else []
+    except (OSError, ValueError):
+        return []
+
+
+def public(c: dict) -> dict:
+    return {k: v for k, v in c.items() if k != "key_hash"}
+
+
+def article_file(path: str) -> Path:
+    p = safe(path)
+    if not p.is_file() or p.suffix != ".md":
+        raise HTTPException(404, "not found")
+    return p
+
+
+def clean_anchor(a: dict) -> dict:
+    return {k: str(a.get(k, ""))[:n] for k, n in (("exact", 1000), ("prefix", 64), ("suffix", 64))}
+
+
+def reanchor(p: Path, anchors: dict):
+    """Editor's save sends where each annotation's text now is (None = text deleted).
+    The first wording is kept in `orig` so readers can see what was annotated."""
+    with COMMENT_LOCK:
+        items = load_comments(p)
+        for c in items:
+            if c["id"] not in anchors or not c.get("anchor"):
+                continue
+            a = anchors[c["id"]]
+            if a is None:
+                c["lost"] = True
+                continue
+            a = clean_anchor(a)
+            if a["exact"] != c["anchor"]["exact"]:
+                c.setdefault("orig", c["anchor"]["exact"])
+            c["anchor"] = a
+            c.pop("lost", None)
+        comments_file(p).write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+@app.get("/api/comments")
+def list_comments(path: str):
+    return [public(c) for c in load_comments(article_file(path))]
+
+
+@app.post("/api/comments")
+def add_comment(path: str = Body(...), body: str = Body(...), name: str = Body(""),
+                parent: str = Body(""), anchor: dict | None = Body(None)):
+    p = article_file(path)
+    body = body.strip()
+    if not body:
+        raise HTTPException(400, "内容不能为空")
+    if len(body) > 10000:
+        raise HTTPException(400, "内容太长（上限 10000 字）")
+    if anchor is not None:
+        anchor = clean_anchor(anchor)
+        if not any(anchor.values()):
+            raise HTTPException(400, "bad anchor")
+    key = secrets.token_urlsafe(16)
+    c = {"id": secrets.token_hex(6), "parent": parent, "name": name.strip()[:32], "body": body,
+         "anchor": None if parent else anchor, "created": now(),
+         "key_hash": hashlib.sha256(key.encode()).hexdigest()}
+    with COMMENT_LOCK:
+        items = load_comments(p)
+        if parent and not any(x["id"] == parent and not x.get("parent") for x in items):
+            raise HTTPException(404, "要回复的评论不存在")
+        if len(items) >= 5000:
+            raise HTTPException(400, "这篇文章的评论太多了")
+        items.append(c)
+        comments_file(p).write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {**public(c), "key": key}
+
+
+@app.delete("/api/comments")
+def delete_comment(path: str, id: str, key: str = "", mdn: str | None = Cookie(None)):
+    """The author (holding the key returned at creation) or an editor may delete; replies go too."""
+    p = article_file(path)
+    with COMMENT_LOCK:
+        items = load_comments(p)
+        c = next((x for x in items if x["id"] == id), None)
+        if not c:
+            raise HTTPException(404, "not found")
+        if not (key and hmac.compare_digest(hashlib.sha256(key.encode()).hexdigest(), c.get("key_hash", ""))):
+            require_auth(mdn)
+        items = [x for x in items if x["id"] != id and x.get("parent") != id]
+        comments_file(p).write_text(json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"ok": True}
+
+
 # ---------- articles ----------
 
 @app.get("/api/articles")
@@ -260,8 +366,11 @@ def move_article(path: str = Body(...), folder: str = Body(""), mdn: str | None 
     target = dest / src.name
     if target.exists():
         raise HTTPException(409, "目标文件夹里已有同名文章")
+    was_dir = src.is_dir()
     shutil.move(str(src), str(target))
-    newp = target / "index.md" if src.is_dir() else target
+    if not was_dir and comments_file(p).is_file():  # a loose .md keeps its sidecar beside it
+        shutil.move(str(comments_file(p)), str(comments_file(target)))
+    newp = target / "index.md" if was_dir else target
     return {"path": newp.relative_to(DATA).as_posix()}
 
 
@@ -288,7 +397,7 @@ def get_article(path: str):
 
 @app.put("/api/article")
 def save_article(path: str = Body(...), content: str = Body(...), base_updated: str = Body(""),
-                 mdn: str | None = Cookie(None)):
+                 anchors: dict | None = Body(None), mdn: str | None = Cookie(None)):
     require_auth(mdn)
     p = safe(path)
     if not p.is_file():
@@ -300,6 +409,8 @@ def save_article(path: str = Body(...), content: str = Body(...), base_updated: 
     meta.setdefault("created", now())
     meta["updated"] = now()
     p.write_text(dump(meta, content), encoding="utf-8")
+    if anchors:
+        reanchor(p, anchors)
     return {"ok": True, "meta": meta}
 
 
@@ -345,6 +456,8 @@ def delete_article(path: str, mdn: str | None = Cookie(None)):
     dst = DATA / ".trash" / f"{datetime.now():%Y%m%d-%H%M%S}" / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(target), str(dst))
+    if target == p and comments_file(p).is_file():
+        shutil.move(str(comments_file(p)), str(comments_file(dst)))
     return {"ok": True, "trash": dst.relative_to(DATA).as_posix()}
 
 

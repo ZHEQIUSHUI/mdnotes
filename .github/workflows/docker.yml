@@ -30,6 +30,12 @@ jobs:
           assert c.post("/api/folder", json={"path": "x"}).status_code == 401
           assert c.post("/api/login", json={"password": "pw"}).status_code == 200
           assert c.post("/api/folder", json={"path": "x"}).status_code == 200
+          c2 = TestClient(app.app)  # comments need no login
+          r = c2.post("/api/comments", json={"path": "demo/index.md", "body": "nice",
+                                             "anchor": {"exact": "hi", "prefix": "", "suffix": ""}}).json()
+          assert c2.get("/api/comments", params={"path": "demo/index.md"}).json()[0]["anchor"]["exact"] == "hi"
+          assert c2.delete("/api/comments", params={"path": "demo/index.md", "id": r["id"], "key": "bad"}).status_code == 401
+          assert c2.delete("/api/comments", params={"path": "demo/index.md", "id": r["id"], "key": r["key"]}).status_code == 200
           PY
 
       - uses: docker/setup-qemu-action@v3

@@ -27,6 +27,7 @@ const ICON = {
   all: '<svg viewBox="0 0 16 16"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v9a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5zM5 5.5h6M5 8h6M5 10.5h4"/></svg>',
   folder: '<svg viewBox="0 0 16 16"><path d="M1.75 4.25c0-.83.67-1.5 1.5-1.5h3l1.5 1.75h5c.83 0 1.5.67 1.5 1.5v5.75c0 .83-.67 1.5-1.5 1.5h-9.5c-.83 0-1.5-.67-1.5-1.5z"/></svg>',
   edit: '<svg viewBox="0 0 16 16"><path d="M11 2.5l2.5 2.5L6 12.5H3.5V10z"/></svg>',
+  note: '<svg viewBox="0 0 16 16"><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z"/></svg>',
   empty: '<svg viewBox="0 0 16 16" class="big"><path d="M3 2h7l3 3v9H3zM10 2v3h3"/></svg>',
 };
 function toast(msg, ms = 2200) {
@@ -164,6 +165,7 @@ window.addEventListener("hashchange", () => route());
 window.addEventListener("beforeunload", (e) => { if (state.dirty) { e.preventDefault(); e.returnValue = ""; } });
 
 async function route() {
+  hidePop();
   const h = decodeURIComponent(location.hash.slice(1) || "/");
   if (state.leaveGuard && !state.leaveGuard()) return;
   state.leaveGuard = null; state.dirty = false;
@@ -244,7 +246,7 @@ async function viewArticle(path) {
       <div class="meta"><span>创建 ${esc(a.meta.created || "-")}</span><span class="dot">·</span><span>最后修改 ${esc(a.meta.updated || "-")}</span><span class="sp"></span>
         <button class="btn small primary" id="aEdit">${ICON.edit}编辑</button><button class="btn small" id="aRen">重命名</button>
         <button class="btn small" id="aMove">移动</button><button class="btn small danger" id="aDel">删除</button></div>
-    </div><div class="md" id="body"></div></article><aside class="toc" id="toc"></aside></div>`;
+    </div><div class="md" id="body"></div><section class="cmts" id="cmts"></section></article><aside class="toc" id="toc"></aside></div>`;
   document.title = a.title + " - 文档";
   const body = $("#body");
   await renderMd(body, a.content.replace(/^\s*#\s+.+\n?/, ""), path);
@@ -255,6 +257,7 @@ async function viewArticle(path) {
   $("#aRen").onclick = () => renameDlg(path, a.title);
   $("#aMove").onclick = () => moveDlg(path);
   $("#aDel").onclick = () => deleteDlg(path, a.title);
+  await setupComments(path, body);
 }
 
 function folderOf(path) {
@@ -348,8 +351,11 @@ async function editArticle(path) {
   const save = async () => {
     try {
       st.textContent = "保存中…";
-      const r = await api("PUT", "/api/article", { path, content: ta.value, base_updated: base });
-      base = r.meta.updated; state.dirty = false; st.textContent = "已保存 " + base.slice(11);
+      const { anchors, moved, lost } = await reanchor(path, ta.value);
+      const r = await api("PUT", "/api/article", { path, content: ta.value, base_updated: base, anchors });
+      base = r.meta.updated; state.dirty = false;
+      st.textContent = "已保存 " + base.slice(11) + (moved ? `；${moved} 条注释已跟随修改后的文字` : "") + (lost ? `；${lost} 条注释的原文已删除` : "");
+      if (lost) toast(`有 ${lost} 条注释对应的文字被删掉了，它们会列在文章下方的“注释”里`, 5000);
     } catch (e) { st.textContent = "保存失败"; toast(e.message === "need-login" ? "登录已过期，请重新登录" : e.message, 5000); if (e.message === "need-login") login(); }
   };
   const upload = async (files) => {
@@ -383,6 +389,311 @@ async function editArticle(path) {
     if (state.dirty && !confirm("还有未保存的修改，确定离开？")) { history.replaceState(null, "", "#/e/" + enc(path)); return false; }
     document.removeEventListener("keydown", onKey); return true;
   };
+}
+
+// ---------- comments & annotations ----------
+// Open to everyone. An annotation is a comment anchored to the rendered text by {exact, prefix, suffix}
+// (exact "" = a point); it is re-located on every render, so small edits elsewhere don't lose it.
+const CTX = 32;
+const ls = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+const cm = { path: "", root: null, items: [] };
+const mdLite = (md) => DOMPurify.sanitize(marked.parse(md));
+
+function textIndex(root) {
+  const nodes = []; let text = "";
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, { acceptNode: (n) =>
+    n.parentElement.closest("svg, .anno-pt") ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
+  for (let n; (n = w.nextNode());) { nodes.push({ n, start: text.length }); text += n.data; }
+  return { nodes, text };
+}
+
+function offsetOf(root, idx, container, off) {
+  if (container.nodeType === 3) { const hit = idx.nodes.find((x) => x.n === container); if (hit) return hit.start + off; }
+  const r = document.createRange(); r.setStart(root, 0); r.setEnd(container, off);
+  let total = 0;
+  for (const { n } of idx.nodes) { if (!r.intersectsNode(n)) break; total += n.data.length; }
+  return total;
+}
+
+// Find where an anchor sits in the current text. Order of attempts:
+//   exact  - the quoted text is still there (context picks the right copy if it repeats)
+//   context- quote was edited, but the text right before / after it survives: take what lies between
+//   fuzzy  - quote edited and moved: best window by character-bigram similarity (>= 0.5)
+// Anything else is "lost" and only listed below the article.
+function bigrams(s) { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const k = s.substr(i, 2); m.set(k, (m.get(k) || 0) + 1); } return m; }
+function dice(a, b) {
+  if (a.length < 2 || b.length < 2) return a === b ? 1 : 0;
+  const A = bigrams(a), B = bigrams(b); let hit = 0;
+  for (const [k, v] of A) hit += Math.min(v, B.get(k) || 0);
+  return (2 * hit) / (a.length + b.length - 2);
+}
+function allIndex(text, key) { const out = []; if (key) for (let i = text.indexOf(key); i >= 0 && out.length < 200; i = text.indexOf(key, i + 1)) out.push(i); return out; }
+
+function locate(text, a) {
+  const p = a.prefix || "", q = a.suffix || "", ex = a.exact || "";
+  const ctx = (s, e) => {
+    let k = 0, j = 0;
+    while (k < p.length && text[s - 1 - k] === p[p.length - 1 - k]) k++;
+    while (j < q.length && text[e + j] === q[j]) j++;
+    return k + j;
+  };
+  let best = null;
+  const take = (s, e, sc, how) => { if (!best || sc > best.sc) best = { s, e, sc, how }; };
+  if (ex) {
+    for (const i of allIndex(text, ex)) take(i, i + ex.length, ctx(i, i + ex.length), "exact");
+    if (best) return best;
+  }
+  // context: where the prefix ends and where the suffix starts
+  const pk = p.slice(-12), qk = q.slice(0, 12);
+  const pEnds = allIndex(text, pk).map((i) => i + pk.length), qStarts = allIndex(text, qk);
+  if (!ex) {  // a point: just needs its surroundings
+    for (const at of pEnds) take(at, at, ctx(at, at), "exact");
+    for (const at of qStarts) take(at, at, ctx(at, at), "exact");
+    return best && best.sc >= Math.min(12, p.length + q.length) ? best : null;
+  }
+  const maxGap = Math.max(2 * ex.length, ex.length + 200);
+  for (const s of pEnds) for (const e of qStarts) {
+    if (e >= s && e - s <= maxGap && text.slice(s, e).trim()) take(s, e, ctx(s, e) + 100 * dice(ex, text.slice(s, e)), "context");
+  }
+  if (best) return best;
+  // fuzzy: seed windows from pieces of the old quote and from one-sided context
+  const L = ex.length, seeds = new Set();
+  for (const s of pEnds) seeds.add(s);
+  for (const e of qStarts) seeds.add(Math.max(0, e - L));
+  const piece = Math.min(8, Math.max(2, Math.floor(L / 3)));
+  for (const off of [0, Math.floor((L - piece) / 2), L - piece]) for (const i of allIndex(text, ex.substr(off, piece))) seeds.add(Math.max(0, i - off));
+  for (const s0 of seeds) {
+    for (const s of [s0 - 4, s0, s0 + 4]) for (const len of [L, Math.round(L * 0.75), Math.round(L * 1.25)]) {
+      if (s < 0 || len < 1) continue;
+      const d = dice(ex, text.slice(s, s + len));
+      if (d >= 0.5) take(s, s + len, 100 * d + ctx(s, s + len), "fuzzy");
+    }
+  }
+  return best;
+}
+
+function wrapRange(root, s, e, id, changed) {
+  for (const { n, start } of textIndex(root).nodes) {
+    const end = start + n.data.length;
+    if (end <= s || start >= e) continue;
+    let node = n;
+    const a = Math.max(s, start) - start, b = Math.min(e, end) - start;
+    if (b < node.data.length) node.splitText(b);
+    if (a > 0) node = node.splitText(a);
+    if (!node.data.trim()) continue;
+    const m = document.createElement("mark"); m.className = changed ? "anno changed" : "anno"; m.dataset.id = id;
+    node.replaceWith(m); m.appendChild(node);
+  }
+}
+
+function insertPoint(root, o, id, num) {
+  const nodes = textIndex(root).nodes;
+  const hit = nodes.find((x) => o > x.start && o <= x.start + x.n.data.length) || nodes[0];
+  if (!hit) return;
+  const pt = document.createElement("sup"); pt.className = "anno-pt"; pt.dataset.id = id; pt.textContent = num;
+  const off = Math.max(0, o - hit.start);
+  if (off >= hit.n.data.length) hit.n.after(pt); else if (off === 0) hit.n.before(pt); else hit.n.splitText(off).before(pt);
+}
+
+function clearAnnos(root) {
+  root.querySelectorAll(".anno-pt").forEach((x) => x.remove());
+  root.querySelectorAll("mark.anno").forEach((m) => m.replaceWith(...m.childNodes));
+  root.normalize();
+}
+
+const annos = () => cm.items.filter((c) => c.anchor && !c.parent);
+const repliesOf = (id) => cm.items.filter((c) => c.parent === id);
+
+function applyAnnos() {
+  const root = cm.root; clearAnnos(root);
+  const { text } = textIndex(root);
+  const list = annos().map((c, i) => ({ c, num: i + 1, at: locate(text, c.anchor) }));
+  for (const x of list) x.c._num = x.num, x.c._lost = !x.at, x.c._how = x.at?.how, x.c._now = x.at ? text.slice(x.at.s, x.at.e) : "";
+  // wrap later spans first so earlier offsets stay valid even when points add elements
+  for (const x of list.filter((x) => x.at).sort((a, b) => b.at.s - a.at.s)) {
+    if (x.c.anchor.exact) wrapRange(root, x.at.s, x.at.e, x.c.id, x.at.how !== "exact"); else insertPoint(root, x.at.s, x.c.id, x.num);
+  }
+}
+
+function canDelete(c) { return state.editor || !!ls.get("mdn-ckeys", {})[c.id]; }
+
+function commentHtml(c, withReply = true) {
+  const reps = withReply ? repliesOf(c.id) : [];
+  return `<div class="cmt" data-id="${c.id}">
+    <div class="cmt-h"><span class="who-n">${esc(c.name || "匿名")}</span><span class="t">${esc(short(c.created))}</span>
+      <span class="sp"></span>${withReply ? `<a class="lnk" data-reply="${c.id}">回复</a>` : ""}
+      ${canDelete(c) ? `<a class="lnk del" data-cdel="${c.id}">删除</a>` : ""}</div>
+    <div class="md cmt-b">${mdLite(c.body)}</div>
+    ${reps.length ? `<div class="reps">${reps.map((r) => commentHtml(r, false)).join("")}</div>` : ""}
+    <div class="rform" id="rf-${c.id}"></div>
+  </div>`;
+}
+
+function formHtml(ph = "写点什么…支持 Markdown，Ctrl+Enter 发表") {
+  return `<div class="cform"><textarea placeholder="${ph}"></textarea>
+    <div class="row"><input class="cname" placeholder="昵称（可不填）" maxlength="32" value="${esc(ls.get("mdn-cname", ""))}">
+    <span class="sp"></span><button class="btn small cancel hidden">取消</button><button class="btn small primary send">发表</button></div></div>`;
+}
+
+function bindForm(box, { parent = "", anchor = null, onCancel = null, focus = true }) {
+  const ta = $("textarea", box), send = $(".send", box), cancel = $(".cancel", box);
+  if (onCancel) { cancel.classList.remove("hidden"); cancel.onclick = onCancel; }
+  const go = async () => {
+    const body = ta.value.trim(); if (!body) { ta.focus(); return; }
+    const name = $(".cname", box).value.trim(); ls.set("mdn-cname", name);
+    send.disabled = true;
+    try {
+      const c = await api("POST", "/api/comments", { path: cm.path, body, name, parent, anchor });
+      ls.set("mdn-ckeys", { ...ls.get("mdn-ckeys", {}), [c.id]: c.key });
+      hidePop(); await refreshComments(); toast(anchor ? "注释已添加" : "已发表");
+    } catch (e) { toast(e.message === "need-login" ? "需要先登录" : e.message, 4000); send.disabled = false; }
+  };
+  send.onclick = go;
+  ta.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") go(); });
+  if (focus) setTimeout(() => ta.focus(), 0);
+}
+
+async function delComment(id) {
+  if (!confirm("删除这条？它下面的回复也会一起删掉。")) return;
+  const key = ls.get("mdn-ckeys", {})[id] || "";
+  try {
+    await api("DELETE", `/api/comments?path=${encodeURIComponent(cm.path)}&id=${id}&key=${encodeURIComponent(key)}`);
+  } catch (e) {
+    if (e.message !== "need-login" || !(await login())) return toast(e.message === "need-login" ? "只有作者或编辑者能删除" : e.message);
+    await api("DELETE", `/api/comments?path=${encodeURIComponent(cm.path)}&id=${id}`);
+  }
+  hidePop(); await refreshComments(); toast("已删除");
+}
+
+function bindActions(el) {
+  el.querySelectorAll("[data-reply]").forEach((a) => a.onclick = () => {
+    const box = $("#rf-" + a.dataset.reply, el);
+    if (box.innerHTML) { box.innerHTML = ""; return; }
+    box.innerHTML = formHtml("回复…"); bindForm(box, { parent: a.dataset.reply, onCancel: () => (box.innerHTML = "") });
+  });
+  el.querySelectorAll("[data-cdel]").forEach((a) => a.onclick = () => delComment(a.dataset.cdel));
+}
+
+function quoteOf(c) {
+  const a = c.anchor, cut = (x, n = 160) => esc(x.length > n ? x.slice(0, n) + "…" : x);
+  const flat = (x) => esc(x.replace(/\s+/g, " "));
+  if (!a.exact) return `<div class="qw"><div class="q pt">…${flat(a.prefix.slice(-20))}<b>▍</b>${flat(a.suffix.slice(0, 20))}…</div></div>`;
+  const now = c._how && c._how !== "exact" ? c._now : a.exact;   // relocated in this render
+  const was = c.orig && c.orig !== now ? c.orig : (now !== a.exact ? a.exact : "");
+  return `<div class="qw"><div class="q">${cut(now)}</div>${was ? `<div class="was">原文已修改，注释时是：「${cut(was, 120)}」</div>` : ""}</div>`;
+}
+
+function renderCommentList() {
+  const box = $("#cmts"); if (!box) return;
+  const tops = cm.items.filter((c) => !c.parent && !c.anchor), an = annos();
+  box.innerHTML = `
+    <h2 class="cmts-h">注释 <span>${an.length}</span></h2>
+    <div class="hint">在正文里<b>选中一段文字</b>，或<b>点一下任意位置</b>，就能在那里插入注释。不用登录。</div>
+    <div class="alist">${an.map((c) => `<div class="aitem${c._lost ? " lost" : ""}" data-aid="${c.id}">
+      <div class="ah"><span class="num">${c._num}</span>${quoteOf(c)}</div>
+      ${c._lost ? `<div class="lostn">注释的那段文字已被删除或大幅改写，找不到原来的位置</div>` : ""}
+      ${commentHtml(c)}</div>`).join("")}</div>
+    <h2 class="cmts-h">评论 <span>${tops.length}</span></h2>
+    <div id="cnew">${formHtml()}</div>
+    <div class="clist">${tops.length ? tops.slice().reverse().map((c) => commentHtml(c)).join("") : `<div class="none">还没有评论</div>`}</div>`;
+  bindForm($("#cnew"), { focus: false });
+  bindActions(box);
+  box.querySelectorAll(".aitem:not(.lost) .ah").forEach((h) => h.onclick = () => {
+    const id = h.parentElement.dataset.aid, el = cm.root.querySelector(`[data-id="${id}"]`);
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    setTimeout(() => showThread(id, el), 400);
+  });
+}
+
+async function refreshComments() {
+  cm.items = await api("GET", "/api/comments?path=" + encodeURIComponent(cm.path)).catch(() => []);
+  applyAnnos(); renderCommentList();
+}
+
+// ---- floating popover: "add annotation" button, annotation form, annotation thread ----
+const pop = document.createElement("div"); pop.className = "apop hidden"; document.body.appendChild(pop);
+function placePop(rect) {
+  pop.classList.remove("hidden");
+  const w = pop.offsetWidth, x = Math.min(Math.max(8, rect.left), document.documentElement.clientWidth - w - 8);
+  pop.style.left = x + scrollX + "px"; pop.style.top = rect.bottom + scrollY + 8 + "px";
+}
+function hidePop() { pop.classList.add("hidden"); pop.innerHTML = ""; pop.dataset.kind = ""; }
+document.addEventListener("mousedown", (e) => { if (!pop.contains(e.target) && pop.dataset.kind !== "form") hidePop(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#modal:not(.hidden)")) hidePop(); });
+
+function rectOf(range) {
+  const rs = range.getClientRects();
+  if (rs.length) return rs[rs.length - 1];
+  const r = range.getBoundingClientRect();
+  if (r.width || r.height) return r;
+  const el = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+  return el.getBoundingClientRect();
+}
+
+function showThread(id, el) {
+  const c = cm.items.find((x) => x.id === id); if (!c) return;
+  pop.dataset.kind = "thread";
+  pop.innerHTML = `<div class="ph">注释 ${c._num}</div>${commentHtml(c)}`;
+  bindActions(pop); placePop(el.getBoundingClientRect());
+}
+
+function onPick(e) {
+  if (pop.contains(e.target) || pop.dataset.kind === "form") return;
+  const hitAnno = e.target.closest(".anno, .anno-pt");
+  const sel = getSelection();
+  if (hitAnno && (!sel.rangeCount || sel.isCollapsed)) return showThread(hitAnno.dataset.id, hitAnno);
+  if (!sel.rangeCount) return;
+  const range = sel.getRangeAt(0);
+  if (!cm.root.contains(range.commonAncestorContainer)) return;
+  if (range.collapsed) {
+    if (e.target.closest("a, img, video, button, svg, input, textarea")) return hidePop();
+  }
+  const idx = textIndex(cm.root);
+  const s = offsetOf(cm.root, idx, range.startContainer, range.startOffset);
+  const t = range.collapsed ? s : offsetOf(cm.root, idx, range.endContainer, range.endOffset);
+  const exact = idx.text.slice(s, t);
+  if (!range.collapsed && !exact.trim()) return hidePop();
+  const anchor = { exact, prefix: idx.text.slice(Math.max(0, s - CTX), s), suffix: idx.text.slice(t, t + CTX) };
+  const rect = rectOf(range);
+  pop.dataset.kind = "btn";
+  pop.innerHTML = `<button class="btn small primary">${ICON.note}${exact ? "注释选中文字" : "在此处插入注释"}</button>`;
+  placePop(rect);
+  $("button", pop).onclick = () => {
+    pop.dataset.kind = "form";
+    pop.innerHTML = `<div class="ph">${exact ? "给选中文字加注释" : "在此处插入注释"}</div>${quoteOf({ anchor })}${formHtml()}`;
+    bindForm(pop, { anchor, onCancel: hidePop });
+    placePop(rect);
+  };
+}
+
+// Called on save: move annotations to where their text now lives, so the next edit is compared
+// against the latest wording instead of the original one.
+async function reanchor(path, content) {
+  const list = (await api("GET", "/api/comments?path=" + encodeURIComponent(path)).catch(() => [])).filter((c) => c.anchor && !c.parent);
+  if (!list.length) return { anchors: {}, moved: 0, lost: 0 };
+  const tmp = document.createElement("div");
+  await renderMd(tmp, content.replace(/^\s*#\s+.+\n?/, ""), path);
+  const { text } = textIndex(tmp);
+  const anchors = {}; let moved = 0, lost = 0;
+  for (const c of list) {
+    const at = locate(text, c.anchor);
+    if (!at) { if (!c.lost) anchors[c.id] = null; lost++; continue; }
+    const n = { exact: c.anchor.exact ? text.slice(at.s, at.e) : "", prefix: text.slice(Math.max(0, at.s - CTX), at.s), suffix: text.slice(at.e, at.e + CTX) };
+    if (n.exact !== c.anchor.exact || n.prefix !== c.anchor.prefix || n.suffix !== c.anchor.suffix || c.lost) {
+      anchors[c.id] = n; if (n.exact !== c.anchor.exact) moved++;
+    }
+  }
+  return { anchors, moved, lost };
+}
+
+async function setupComments(path, root) {
+  cm.path = path; cm.root = root; cm.items = []; hidePop();
+  root.addEventListener("mouseup", (e) => setTimeout(() => onPick(e), 0));
+  await refreshComments();
 }
 
 // ---------- boot ----------
