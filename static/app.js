@@ -211,13 +211,19 @@ async function listPage(folder, q = $("#search").value.trim()) {
     </a>`).join("");
 
   const heading = q ? `搜索 “${esc(q)}”` : folder ? esc(folder.split("/").pop()) : "全部文章";
-  app.innerHTML = `<div class="layout"><nav class="side"><div class="side-h">文件夹</div>${side}</nav><section class="content">
+  app.innerHTML = `<div class="layout"><nav class="side"><div class="side-h">文件夹</div>${side}
+      <button class="btn small side-new">新建文件夹</button></nav><div class="side-mask"></div><section class="content">
+    <button class="btn small fold-btn">${ICON.folder}<span>${folder ? esc(folder) : "全部文章"}</span><b>▾</b></button>
     <div class="list-h"><h2>${heading}</h2><span class="cnt">${items.length} 篇 · 按最后修改排序</span></div>
     ${folder && !q ? `<div class="crumb"><a href="#/">全部</a> / ${esc(folder)}</div>` : ""}
     ${items.length ? `<div class="cards">${rows}</div>`
       : `<div class="empty">${ICON.empty}<div>${q ? "没有匹配的文章" : "这里还没有文章"}</div></div>`}
   </section></div>`;
   state.curFolder = folder;
+  const lay = $(".layout", app), toggle = (on) => lay.classList.toggle("side-open", on);
+  $(".fold-btn", app).onclick = () => toggle(true);
+  $(".side-mask", app).onclick = () => toggle(false);
+  $(".side-new", app).onclick = () => { toggle(false); $("#btnFolder").click(); };
   app.querySelectorAll("[data-del]").forEach((x) => x.addEventListener("click", async (e) => {
     e.preventDefault(); e.stopPropagation();
     if (!(await needEditor())) return;
