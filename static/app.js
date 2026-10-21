@@ -29,6 +29,7 @@ const ICON = {
   edit: '<svg viewBox="0 0 16 16"><path d="M11 2.5l2.5 2.5L6 12.5H3.5V10z"/></svg>',
   note: '<svg viewBox="0 0 16 16"><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z"/></svg>',
   down: '<svg viewBox="0 0 16 16"><path d="M8 2.5v8M4.5 7.5 8 11l3.5-3.5M3 13.5h10"/></svg>',
+  list: '<svg viewBox="0 0 16 16"><path d="M5.5 4h8M5.5 8h8M5.5 12h8M2.5 4h.01M2.5 8h.01M2.5 12h.01"/></svg>',
   empty: '<svg viewBox="0 0 16 16" class="big"><path d="M3 2h7l3 3v9H3zM10 2v3h3"/></svg>',
 };
 function toast(msg, ms = 2200) {
@@ -166,7 +167,7 @@ window.addEventListener("hashchange", () => route());
 window.addEventListener("beforeunload", (e) => { if (state.dirty) { e.preventDefault(); e.returnValue = ""; } });
 
 async function route() {
-  hidePop();
+  hidePop(); state.tocHeads = null;
   const h = decodeURIComponent(location.hash.slice(1) || "/");
   if (state.leaveGuard && !state.leaveGuard()) return;
   state.leaveGuard = null; state.dirty = false;
@@ -257,15 +258,37 @@ async function viewArticle(path) {
   document.title = a.title + " - 文档";
   const body = $("#body");
   await renderMd(body, a.content.replace(/^\s*#\s+.+\n?/, ""), path);
-  const hs = [...body.querySelectorAll("h2,h3,h4")];
-  $("#toc").innerHTML = hs.length > 2 ? "<div class=\"toc-h\">目录</div>" + hs.map((h) => `<a class="l${h.tagName[1]}" href="javascript:void(0)" data-id="${h.id}">${esc(h.textContent)}</a>`).join("") : "";
-  $("#toc").querySelectorAll("a").forEach((x) => x.onclick = () => document.getElementById(x.dataset.id).scrollIntoView({ behavior: "smooth" }));
+  const hs = [...body.querySelectorAll("h1,h2,h3,h4")];
+  const top = Math.min(...hs.map((h) => +h.tagName[1]));
+  const toc = $("#toc"), wrap = $(".article-wrap");
+  toc.innerHTML = hs.length >= 2 ? `<div class="toc-h">目录<a class="toc-x">✕</a></div>` + hs.map((h) =>
+    `<a class="d${h.tagName[1] - top}" href="javascript:void(0)" data-id="${h.id}">${esc(h.textContent)}</a>`).join("") : "";
+  if (hs.length >= 2) {
+    wrap.insertAdjacentHTML("beforeend", `<button class="toc-fab" title="目录">${ICON.list}<span>目录</span></button><div class="toc-mask"></div>`);
+    const open = (on) => wrap.classList.toggle("toc-open", on);
+    $(".toc-fab", wrap).onclick = () => { open(true); toc.querySelector("a.on")?.scrollIntoView({ block: "center" }); };
+    $(".toc-mask", wrap).onclick = $(".toc-x", toc).onclick = () => open(false);
+    toc.querySelectorAll("a[data-id]").forEach((x) => x.onclick = () => {
+      open(false); document.getElementById(x.dataset.id).scrollIntoView({ behavior: "smooth" });
+    });
+    state.tocHeads = { hs, links: [...toc.querySelectorAll("a[data-id]")] };
+    markToc();
+  }
   $("#aEdit").onclick = async () => { if (await needEditor()) location.hash = "#/e/" + enc(path); };
   $("#aRen").onclick = () => renameDlg(path, a.title);
   $("#aMove").onclick = () => moveDlg(path);
   $("#aDel").onclick = () => deleteDlg(path, a.title);
   await setupComments(path, body);
 }
+
+// highlight the section being read
+function markToc() {
+  const t = state.tocHeads; if (!t) return;
+  let cur = 0;
+  t.hs.forEach((h, i) => { if (h.getBoundingClientRect().top < 120) cur = i; });
+  t.links.forEach((a, i) => a.classList.toggle("on", i === cur));
+}
+addEventListener("scroll", () => requestAnimationFrame(markToc), { passive: true });
 
 function folderOf(path) {
   const parts = path.split("/");
